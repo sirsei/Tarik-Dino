@@ -1,0 +1,861 @@
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
+local GuiService = game:GetService("GuiService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local MACLIB_URL = "https://raw.githubusercontent.com/sirsei/maclib/refs/heads/main/mainUI"
+local BLURRED_AVATAR_ASSET = "rbxassetid://18824089198"
+
+-- Load MacLib dari mainUI dengan fallback aman
+local function fetchSource(url)
+	if typeof(game.HttpGet) == "function" then
+		local ok, res = pcall(function()
+			return game:HttpGet(url, true)
+		end)
+		if ok and type(res) == "string" and #res > 0 then
+			return res
+		end
+	end
+
+	local reqFn = (syn and syn.request) or request or http_request or (http and http.request)
+	if type(reqFn) == "function" then
+		local ok, res = pcall(reqFn, { Url = url, Method = "GET" })
+		if ok and type(res) == "table" and type(res.Body) == "string" and #res.Body > 0 then
+			return res.Body
+		end
+	end
+
+	return nil
+end
+
+local function compileLua(code)
+	local loader = loadstring or load
+	if type(loader) ~= "function" then
+		return nil, "loadstring/load tidak tersedia di executor ini."
+	end
+
+	local chunk, err = loader(code)
+	if type(chunk) == "function" then
+		return chunk, nil
+	end
+
+	if tostring(err):find("got <eof>") then
+		local patched = code
+		for i = 1, 10 do
+			patched = patched .. "\nend"
+			local retryChunk, retryErr = loader(patched)
+			if type(retryChunk) == "function" then
+				warn(("[MacLib] mainUI terpotong di EOF, menambahkan %d 'end' darurat."):format(i))
+				return retryChunk, nil
+			end
+			err = retryErr
+		end
+	end
+
+	return nil, err
+end
+
+local rawSource = fetchSource(MACLIB_URL)
+assert(rawSource, "[MacLib] Gagal mengambil kode dari URL: " .. MACLIB_URL)
+
+local chunk, compileErr = compileLua(rawSource)
+assert(type(chunk) == "function", "[MacLib] Gagal compile kode: " .. tostring(compileErr))
+
+local MacLib = chunk()
+assert(type(MacLib) == "table" and type(MacLib.Window) == "function", "[MacLib] Modul MacLib tidak mengembalikan tabel yang valid.")
+
+-- Bersihkan UI lama jika ada
+for _, name in ipairs({ "DinoTeleportUI", "SeiScriptUI", "SeiScriptMacLib" }) do
+	local old = playerGui:FindFirstChild(name)
+	if old then
+		old:Destroy()
+	end
+end
+
+-- ==========================================
+-- PENGATURAN AUTOFARM, AUTO TAP X2 & KEYBIND
+-- ==========================================
+local autoFarmEnabled = false
+local autoTapX2Enabled = false
+local minimizeKeybind = Enum.KeyCode.RightControl
+local uiMinimized = false
+
+local THROW_COOLDOWN = 0.35
+local CONTINUE_COOLDOWN = 0.45
+local POST_TELEPORT_WAIT = 0.35
+local POST_CONTINUE_WAIT = 0.35
+local CONTINUE_WATCHDOG_TIME = 4.5
+local STATE_STUCK_TIMEOUT = 7.0
+local X2_SCAN_INTERVAL = 0.025
+local X2_TAP_COOLDOWN = 0.07
+local HUB_TILE_INDEX = 379
+
+-- Mentok ke puncak paling atas bar/UI (Y.Scale 0 = paling atas)
+local TOP_ZONE_MAX_Y_SCALE = 0.015
+
+local lastThrowTime = 0
+local lastContinueTime = 0
+local lastX2TapTime = 0
+local farmState = "TELEPORT" -- "TELEPORT" | "THROW" | "CONTINUE"
+local farmLoopRunning = false
+local x2LoopRunning = false
+
+-- ==========================================
+-- ANTI-IDLE (ANTI-AFK)
+-- ==========================================
+local idledConn = player.Idled:Connect(function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end)
+
+-- ==========================================
+-- HOOK REMOTES TRAINING (AUTO HIT BUBBLE X2)
+-- ==========================================
+local trainBubbleConn = nil
+local remotesRef = nil
+
+local function setupTrainBubbleHook()
+	if trainBubbleConn then
+		return
+	end
+
+	task.spawn(function()
+		local shared = ReplicatedStorage:WaitForChild("Shared", 10)
+		local remotesModule = shared and shared:FindFirstChild("Remotes")
+		if not remotesModule then
+			return
+		end
+
+		local ok, Remotes = pcall(require, remotesModule)
+		if ok and Remotes then
+			remotesRef = Remotes
+			if Remotes.TrainBubble and Remotes.TrainBubbleHit then
+				trainBubbleConn = Remotes.TrainBubble.OnClientEvent:Connect(function(bubbleId, _duration)
+					if not autoTapX2Enabled or not bubbleId then
+						return
+					end
+					task.wait(0.03)
+					if autoTapX2Enabled then
+						pcall(function()
+							Remotes.TrainBubbleHit:FireServer(bubbleId)
+						end)
+					end
+				end)
+			end
+		end
+	end)
+end
+
+setupTrainBubbleHook()
+
+-- ==========================================
+-- FUNGSI AMBIL POSISI PERMUKAAN ATAS TARGET
+-- ==========================================
+local function getTargetCFrame(character, targetObj)
+	if not targetObj then
+		return nil
+	end
+
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+
+	local footOffset = 3
+	if humanoid and hrp then
+		if humanoid.RigType == Enum.HumanoidRigType.R15 then
+			footOffset = humanoid.HipHeight + (hrp.Size.Y * 0.5)
+		else
+			footOffset = (humanoid.HipHeight > 0 and humanoid.HipHeight or 2) + (hrp.Size.Y * 0.5) + 0.5
+		end
+	end
+
+	if targetObj:IsA("BasePart") then
+		local topSurfacePos = targetObj.CFrame:PointToWorldSpace(Vector3.new(0, targetObj.Size.Y * 0.5, 0))
+		local _, yRot, _ = targetObj.CFrame:ToOrientation()
+		return CFrame.new(topSurfacePos + Vector3.new(0, footOffset + 0.2, 0)) * CFrame.Angles(0, yRot, 0)
+	end
+
+	if targetObj:IsA("Model") then
+		local cf, size = targetObj:GetBoundingBox()
+		local topSurfacePos = cf:PointToWorldSpace(Vector3.new(0, size.Y * 0.5, 0))
+		local _, yRot, _ = cf:ToOrientation()
+		return CFrame.new(topSurfacePos + Vector3.new(0, footOffset + 0.2, 0)) * CFrame.Angles(0, yRot, 0)
+	end
+
+	return nil
+end
+
+local function getThrowPadObject()
+	local map = workspace:FindFirstChild("Map")
+	local throwArea = map and map:FindFirstChild("ThrowArea")
+	local platform = throwArea and throwArea:FindFirstChild("Platform")
+	return platform and platform:FindFirstChild("ThrowPad")
+end
+
+local function getShopZoneObject()
+	local map = workspace:FindFirstChild("Map")
+	local market = map and map:FindFirstChild("Market")
+	local sellStand = market and market:FindFirstChild("SellStand")
+	return sellStand and sellStand:FindFirstChild("Zone")
+end
+
+local function getHarpoonTileObject()
+	local map = workspace:FindFirstChild("Map")
+	local hub = map and map:FindFirstChild("Hub")
+	local hubFloor = hub and hub:FindFirstChild("HubFloor")
+	if not hubFloor then
+		return nil
+	end
+
+	local children = hubFloor:GetChildren()
+	return children[HUB_TILE_INDEX]
+end
+
+local function getClanCarpetObject()
+	local map = workspace:FindFirstChild("Map")
+	local clanHall = map and map:FindFirstChild("ClanHall")
+	return clanHall and clanHall:FindFirstChild("Carpet")
+end
+
+local function performCleanTeleport(targetObj)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	local targetCFrame = getTargetCFrame(character, targetObj)
+
+	if character and humanoid and hrp and targetCFrame then
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.AssemblyLinearVelocity = Vector3.zero
+				part.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+
+		character:PivotTo(targetCFrame)
+		humanoid:ChangeState(Enum.HumanoidStateType.Landed)
+		return true
+	end
+
+	return false
+end
+
+-- ==========================================
+-- FUNGSI DETEKSI THROW METER, CONTINUE & X2 UI
+-- ==========================================
+local function findThrowElements()
+	for _, gui in ipairs(playerGui:GetChildren()) do
+		if gui:IsA("ScreenGui") and gui.Name ~= "SeiScriptMacLib" then
+			local layer = gui:FindFirstChild("ThrowLayer", true)
+			if layer then
+				local meter = layer:FindFirstChild("Meter", true)
+				local bar = meter and meter:FindFirstChild("Bar", true)
+				local slider = meter and meter:FindFirstChild("Slider", true)
+				local perfectBand = bar and bar:FindFirstChild("PerfectBand", true)
+				local prompt = layer:FindFirstChild("Prompt", true)
+				local reveal = layer:FindFirstChild("Reveal", true)
+				local roller = layer:FindFirstChild("Roller", true)
+				local stamp = layer:FindFirstChild("Stamp", true)
+				local continueObj = reveal and reveal:FindFirstChild("Continue", true)
+					or layer:FindFirstChild("Continue", true)
+
+				if meter and slider then
+					return meter, slider, perfectBand, prompt, reveal, continueObj, roller, stamp
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function isSliderInTopZone(slider)
+	local sliderY = slider.Position.Y.Scale
+	return sliderY <= TOP_ZONE_MAX_Y_SCALE
+end
+
+local function sendScreenClick(xRatio, yRatio)
+	local camera = workspace.CurrentCamera
+	local vp = camera and camera.ViewportSize or Vector2.new(1280, 720)
+	local x = vp.X * (xRatio or 0.5)
+	local y = vp.Y * (yRatio or 0.5)
+
+	VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+	task.wait(0.02)
+	VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+end
+
+local function isGuiActuallyVisible(guiObj)
+	local current = guiObj
+	while current and current ~= playerGui do
+		if current:IsA("ScreenGui") or current:IsA("BillboardGui") then
+			if not current.Enabled then
+				return false
+			end
+		elseif current:IsA("GuiObject") then
+			if not current.Visible then
+				return false
+			end
+		end
+		current = current.Parent
+	end
+	return true
+end
+
+local function findVisibleX2HitButtons()
+	local buttons = {}
+	local padHud = playerGui:FindFirstChild("PAD_HUD")
+	local root = padHud and padHud:FindFirstChild("Root")
+	local x2Target = root and root:FindFirstChild("X2Target")
+
+	if x2Target and x2Target:IsA("GuiObject") and isGuiActuallyVisible(x2Target) then
+		local hitBtn = x2Target:FindFirstChild("Hit")
+		if hitBtn and hitBtn:IsA("GuiButton") and isGuiActuallyVisible(hitBtn) then
+			table.insert(buttons, hitBtn)
+		elseif x2Target:IsA("GuiButton") then
+			table.insert(buttons, x2Target)
+		end
+	end
+
+	return buttons
+end
+
+local tappedRecently = setmetatable({}, { __mode = "k" })
+local tappingInProgress = false
+
+local function fireButtonDirectly(btn)
+	if typeof(firesignal) == "function" then
+		pcall(firesignal, btn.Activated)
+		pcall(firesignal, btn.MouseButton1Click)
+		return true
+	end
+
+	if typeof(getconnections) == "function" then
+		local fired = false
+		for _, signalName in ipairs({ "Activated", "MouseButton1Click" }) do
+			local ok, conns = pcall(getconnections, btn[signalName])
+			if ok and type(conns) == "table" then
+				for _, conn in ipairs(conns) do
+					if conn.Function then
+						pcall(conn.Function)
+						fired = true
+					end
+				end
+			end
+		end
+		return fired
+	end
+
+	return false
+end
+
+local function tapGuiButton(btn)
+	if tappingInProgress then
+		return
+	end
+
+	local now = os.clock()
+	if now - lastX2TapTime < X2_TAP_COOLDOWN then
+		return
+	end
+	if tappedRecently[btn] and (now - tappedRecently[btn]) < 0.12 then
+		return
+	end
+
+	tappingInProgress = true
+	lastX2TapTime = now
+	tappedRecently[btn] = now
+
+	task.spawn(function()
+		local fired = fireButtonDirectly(btn)
+		if not fired then
+			local pos = btn.AbsolutePosition
+			local size = btn.AbsoluteSize
+			if size.X > 0 and size.Y > 0 then
+				local x = pos.X + (size.X * 0.5)
+				local y = pos.Y + (size.Y * 0.5)
+				local padHud = btn:FindFirstAncestorOfClass("ScreenGui")
+				if padHud and not padHud.IgnoreGuiInset then
+					y = y + GuiService:GetGuiInset().Y
+				end
+
+				VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+				task.wait(0.01)
+				VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+			end
+		end
+		tappingInProgress = false
+	end)
+end
+
+-- ==========================================
+-- LOOP AUTOFARM & AUTO X2
+-- ==========================================
+local window -- dideklarasikan di bawah setelah MacLib Window dibuat
+
+local function startAutoFarmLoop()
+	if farmLoopRunning then
+		return
+	end
+	farmLoopRunning = true
+	farmState = "TELEPORT"
+
+	task.spawn(function()
+		local stateEnteredAt = os.clock()
+		local continueEnteredAt = 0
+
+		local function setFarmState(nextState)
+			farmState = nextState
+			stateEnteredAt = os.clock()
+			if nextState == "CONTINUE" then
+				continueEnteredAt = os.clock()
+			else
+				continueEnteredAt = 0
+			end
+		end
+
+		while autoFarmEnabled do
+			RunService.RenderStepped:Wait()
+			if not autoFarmEnabled then
+				break
+			end
+
+			local now = os.clock()
+
+			if (now - stateEnteredAt) >= STATE_STUCK_TIMEOUT then
+				setFarmState("TELEPORT")
+			end
+
+			local meter, slider, _, prompt, reveal, continueObj, roller, stamp = findThrowElements()
+			local isContinueVisible = continueObj
+				and continueObj.Visible
+				and (continueObj.TextTransparency or 0) < 0.92
+			local isRevealVisible = reveal and reveal.Visible
+			local isRollerVisible = roller and roller.Visible
+			local isStampVisible = stamp and stamp.Visible and (stamp.TextTransparency or 0) < 0.92
+			local isMeterVisible = meter and meter.Visible
+
+			if farmState == "TELEPORT" then
+				if isContinueVisible then
+					if (now - lastContinueTime) >= CONTINUE_COOLDOWN then
+						lastContinueTime = now
+						pcall(sendScreenClick, 0.5, 0.85)
+						task.wait(POST_CONTINUE_WAIT)
+					end
+					continue
+				end
+
+				local pad = getThrowPadObject()
+				local ok = false
+				if pad then
+					local success, result = pcall(performCleanTeleport, pad)
+					ok = success and result == true
+				end
+
+				if ok then
+					task.wait(POST_TELEPORT_WAIT)
+					setFarmState("THROW")
+				else
+					task.wait(0.4)
+				end
+
+			elseif farmState == "THROW" then
+				if isContinueVisible then
+					setFarmState("CONTINUE")
+					continue
+				end
+
+				if not meter or not slider then
+					continue
+				end
+
+				if isMeterVisible and (not prompt or prompt.Visible) then
+					if isSliderInTopZone(slider) then
+						if (now - lastThrowTime) >= THROW_COOLDOWN then
+							lastThrowTime = now
+							pcall(sendScreenClick, 0.5, 0.5)
+							setFarmState("CONTINUE")
+						end
+					end
+				end
+
+			elseif farmState == "CONTINUE" then
+				if continueEnteredAt == 0 then
+					continueEnteredAt = now
+				end
+
+				if isContinueVisible then
+					if (now - lastContinueTime) >= CONTINUE_COOLDOWN then
+						lastContinueTime = now
+						pcall(sendScreenClick, 0.5, 0.85)
+						task.wait(0.25)
+					end
+				elseif not isRevealVisible and not isRollerVisible and not isStampVisible and not isMeterVisible then
+					task.wait(POST_CONTINUE_WAIT)
+					setFarmState("TELEPORT")
+				elseif (now - continueEnteredAt) >= CONTINUE_WATCHDOG_TIME then
+					pcall(sendScreenClick, 0.5, 0.85)
+					task.wait(POST_CONTINUE_WAIT)
+					setFarmState("TELEPORT")
+				end
+			end
+		end
+
+		farmState = "TELEPORT"
+		farmLoopRunning = false
+	end)
+end
+
+local function startAutoX2Loop()
+	if x2LoopRunning then
+		return
+	end
+	x2LoopRunning = true
+
+	task.spawn(function()
+		while autoTapX2Enabled do
+			local hitButtons = findVisibleX2HitButtons()
+			for _, hitBtn in ipairs(hitButtons) do
+				if not autoTapX2Enabled then
+					break
+				end
+				pcall(tapGuiButton, hitBtn)
+			end
+			task.wait(X2_SCAN_INTERVAL)
+		end
+		x2LoopRunning = false
+	end)
+end
+
+local function notifyUser(title, content)
+	if window and typeof(window.Notify) == "function" then
+		pcall(function()
+			window:Notify({
+				Title = title,
+				Description = content,
+				Lifetime = 2.5,
+			})
+		end)
+	end
+end
+
+-- ==========================================
+-- UNBLUR AVATAR & TOGGLE / MINIMIZE UI
+-- ==========================================
+local function getPlayerAvatarImage()
+	local ok, thumb = pcall(function()
+		return Players:GetUserThumbnailAsync(
+			player.UserId,
+			Enum.ThumbnailType.HeadShot,
+			Enum.ThumbnailSize.Size420x420
+		)
+	end)
+	if ok and type(thumb) == "string" and #thumb > 0 then
+		return thumb
+	end
+	return ("rbxthumb://type=AvatarHeadShot&id=%d&w=420&h=420"):format(player.UserId)
+end
+
+local function unblurAvatarInGuis()
+	local clearAvatar = getPlayerAvatarImage()
+	local roots = { playerGui }
+
+	local coreGui = (cloneref and cloneref(game:GetService("CoreGui"))) or game:GetService("CoreGui")
+	if coreGui then
+		table.insert(roots, coreGui)
+	end
+	if typeof(gethui) == "function" then
+		local ok, hui = pcall(gethui)
+		if ok and hui then
+			table.insert(roots, hui)
+		end
+	end
+
+	for _, root in ipairs(roots) do
+		local ok, desc = pcall(function()
+			return root:GetDescendants()
+		end)
+		if ok and type(desc) == "table" then
+			for _, obj in ipairs(desc) do
+				if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.Image == BLURRED_AVATAR_ASSET then
+					obj.Image = clearAvatar
+					if obj.ImageTransparency > 0.25 then
+						obj.ImageTransparency = 0
+					end
+				end
+			end
+		end
+	end
+end
+
+local function setUiMinimized(state)
+	uiMinimized = not not state
+
+	if window then
+		if uiMinimized and typeof(window.Minimize) == "function" then
+			local ok = pcall(function()
+				window:Minimize()
+			end)
+			if ok then
+				return
+			end
+		elseif (not uiMinimized) and typeof(window.Maximize) == "function" then
+			local ok = pcall(function()
+				window:Maximize()
+			end)
+			if ok then
+				return
+			end
+		end
+	end
+
+	-- Fallback jika MacLib tidak mengekspos Minimize/Maximize langsung
+	for _, gui in ipairs(playerGui:GetChildren()) do
+		if gui:IsA("ScreenGui") then
+			local base = gui:FindFirstChild("Base", true)
+			if base and base:IsA("GuiObject") then
+				base.Visible = not uiMinimized
+				return
+			end
+		end
+	end
+end
+
+local function toggleUiMinimize()
+	setUiMinimized(not uiMinimized)
+end
+
+-- ==========================================
+-- PEMBUATAN UI MACLIB (SEISCRIPT)
+-- ==========================================
+window = MacLib:Window({
+	Title = "SeiScript",
+	Subtitle = "AutoFarm & Teleport Hub",
+	Size = UDim2.fromOffset(520, 360),
+	DragStyle = 1,
+	DisabledWindowControls = false,
+	ShowUserInfo = true,
+	Keybind = minimizeKeybind,
+	AcrylicBlur = true,
+})
+
+task.defer(unblurAvatarInGuis)
+task.delay(0.3, unblurAvatarInGuis)
+
+local mainTabGroup = window:TabGroup()
+local mainTab = mainTabGroup:Tab({
+	Name = "Main",
+	Image = "",
+	default = true,
+})
+
+local farmSection = mainTab:Section({
+	Side = "Left",
+})
+
+farmSection:Header({
+	Name = "Automation",
+})
+
+farmSection:Toggle({
+	Name = "AutoFarm",
+	Default = false,
+	Callback = function(value)
+		autoFarmEnabled = value
+		farmState = "TELEPORT"
+		if value then
+			startAutoFarmLoop()
+		end
+	end,
+}, "AutoFarmToggle")
+
+farmSection:Toggle({
+	Name = "Auto X2",
+	Default = false,
+	Callback = function(value)
+		autoTapX2Enabled = value
+		if value then
+			startAutoX2Loop()
+		end
+	end,
+}, "AutoX2Toggle")
+
+farmSection:Divider()
+
+farmSection:Label({
+	Text = "Anti-Idle aktif otomatis.",
+})
+
+local tpSection = mainTab:Section({
+	Side = "Right",
+})
+
+tpSection:Header({
+	Name = "Teleport",
+})
+
+tpSection:Button({
+	Name = "🦴 SHOP",
+	Callback = function()
+		local ok, moved = pcall(performCleanTeleport, getShopZoneObject())
+		if ok and moved then
+			notifyUser("SeiScript", "Teleported to Shop.")
+		else
+			notifyUser("SeiScript", "Shop not found.")
+		end
+	end,
+})
+
+tpSection:Button({
+	Name = "🔱 HARPOON",
+	Callback = function()
+		local ok, moved = pcall(performCleanTeleport, getHarpoonTileObject())
+		if ok and moved then
+			notifyUser("SeiScript", "Teleported to Harpoon.")
+		else
+			notifyUser("SeiScript", "Harpoon tile not found.")
+		end
+	end,
+})
+
+tpSection:Button({
+	Name = "🛡️ CLAN",
+	Callback = function()
+		local ok, moved = pcall(performCleanTeleport, getClanCarpetObject())
+		if ok and moved then
+			notifyUser("SeiScript", "Teleported to Clan.")
+		else
+			notifyUser("SeiScript", "Clan carpet not found.")
+		end
+	end,
+})
+
+-- ==========================================
+-- TAB MISC: PENGATURAN KEYBIND MINIMIZE
+-- ==========================================
+local miscTab = mainTabGroup:Tab({
+	Name = "Misc",
+	Image = "",
+	default = false,
+})
+
+local miscSection = miscTab:Section({
+	Side = "Left",
+})
+
+miscSection:Header({
+	Name = "Keybind & UI",
+})
+
+local function applyMinimizeKeybind(newKey)
+	if typeof(newKey) == "EnumItem" and newKey.EnumType == Enum.KeyCode then
+		minimizeKeybind = newKey
+		if window and typeof(window.SetKeybind) == "function" then
+			pcall(function()
+				window:SetKeybind(newKey)
+			end)
+		elseif window and type(window.Settings) == "table" then
+			window.Settings.Keybind = newKey
+		end
+		notifyUser("SeiScript", "Keybind minimize diubah ke: " .. newKey.Name)
+	end
+end
+
+-- Coba pakai elemen Keybind/Keypicker MacLib jika tersedia, atau fallback tombol rebind
+local addedMacKeybind = false
+for _, methodName in ipairs({ "Keybind", "Keypicker" }) do
+	if typeof(miscSection[methodName]) == "function" then
+		local ok = pcall(function()
+			miscSection[methodName](miscSection, {
+				Name = "Minimize Keybind",
+				Default = minimizeKeybind,
+				Callback = function(key)
+					applyMinimizeKeybind(key)
+				end,
+			}, "MinimizeKeybind")
+		end)
+		if ok then
+			addedMacKeybind = true
+			break
+		end
+	end
+end
+
+if not addedMacKeybind then
+	local listeningForKey = false
+	local keybindLabel = miscSection:Label({
+		Text = "Minimize Keybind: " .. minimizeKeybind.Name,
+	})
+
+	miscSection:Button({
+		Name = "Set Minimize Keybind",
+		Callback = function()
+			listeningForKey = true
+			notifyUser("SeiScript", "Tekan tombol keyboard apa saja untuk mengatur keybind minimize...")
+			if keybindLabel and typeof(keybindLabel.Set) == "function" then
+				pcall(function()
+					keybindLabel:Set("Minimize Keybind: [Menekan tombol...]")
+				end)
+			end
+		end,
+	})
+
+	local rebindConn
+	rebindConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if not listeningForKey then
+			if not gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == minimizeKeybind then
+				toggleUiMinimize()
+			end
+			return
+		end
+
+		if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+			listeningForKey = false
+			applyMinimizeKeybind(input.KeyCode)
+			if keybindLabel and typeof(keybindLabel.Set) == "function" then
+				pcall(function()
+					keybindLabel:Set("Minimize Keybind: " .. minimizeKeybind.Name)
+				end)
+			end
+		end
+	end)
+
+	miscSection:Button({
+		Name = "Toggle Minimize Sekarang",
+		Callback = function()
+			toggleUiMinimize()
+		end,
+	})
+end
+
+local charAddedConn = player.CharacterAdded:Connect(function()
+	if autoFarmEnabled then
+		farmState = "TELEPORT"
+	end
+	unblurAvatarInGuis()
+end)
+
+window:OnClose(function()
+	autoFarmEnabled = false
+	autoTapX2Enabled = false
+	if charAddedConn then
+		charAddedConn:Disconnect()
+		charAddedConn = nil
+	end
+	if idledConn then
+		idledConn:Disconnect()
+		idledConn = nil
+	end
+	if trainBubbleConn then
+		trainBubbleConn:Disconnect()
+		trainBubbleConn = nil
+	end
+end)
+
+window:SelectTab(mainTab)
