@@ -1,0 +1,2 @@
+# Tarik-Dino
+Game gampang
