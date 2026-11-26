@@ -85,6 +85,7 @@ end
 local autoFarmEnabled = false
 local autoTapX2Enabled = false
 local autoClaimGiftEnabled = false
+local autoEquipBestEnabled = false
 local minimizeKeybind = Enum.KeyCode.RightControl
 
 local THROW_COOLDOWN = 0.35
@@ -97,6 +98,7 @@ local X2_SCAN_INTERVAL = 0.025
 local X2_TAP_COOLDOWN = 0.07
 local GIFT_SCAN_INTERVAL = 0.5
 local GIFT_CLAIM_COOLDOWN = 0.35
+local EQUIP_BEST_INTERVAL = 5 -- detik antar panggilan Equip Best
 local HUB_TILE_INDEX = 379
 
 -- Mentok ke puncak paling atas bar/UI (Y.Scale 0 = paling atas)
@@ -110,6 +112,7 @@ local farmState = "TELEPORT" -- "TELEPORT" | "THROW" | "CONTINUE"
 local farmLoopRunning = false
 local x2LoopRunning = false
 local giftLoopRunning = false
+local equipBestLoopRunning = false
 
 -- ==========================================
 -- ANTI-IDLE (ANTI-AFK)
@@ -652,6 +655,42 @@ local function startAutoClaimGiftLoop()
 	end)
 end
 
+-- Loop ringan: hanya satu thread, tidur di antara panggilan,
+-- dan InvokeServer ditunggu selesai dulu sehingga request tidak menumpuk.
+local function startAutoEquipBestLoop()
+	if equipBestLoopRunning then
+		return
+	end
+	equipBestLoopRunning = true
+
+	task.spawn(function()
+		local dinoAction = nil
+
+		while autoEquipBestEnabled do
+			if not dinoAction or not dinoAction.Parent then
+				local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+				dinoAction = remotes and remotes:FindFirstChild("DinoAction")
+			end
+
+			if dinoAction then
+				local ok, err = pcall(function()
+					return dinoAction:InvokeServer("EquipBest")
+				end)
+				if not ok then
+					warn("[SeiScript] Auto Equip Best gagal: " .. tostring(err))
+				end
+			end
+
+			local nextRun = os.clock() + EQUIP_BEST_INTERVAL
+			while autoEquipBestEnabled and os.clock() < nextRun do
+				task.wait(0.25)
+			end
+		end
+
+		equipBestLoopRunning = false
+	end)
+end
+
 local function notifyUser(title, content)
 	if window and typeof(window.Notify) == "function" then
 		pcall(function()
@@ -746,7 +785,7 @@ farmSection:Header({
 })
 
 farmSection:Toggle({
-	Name = "AutoFarm",
+	Name = "Auto Farm",
 	Default = false,
 	Callback = function(value)
 		autoFarmEnabled = value
@@ -758,7 +797,7 @@ farmSection:Toggle({
 }, "AutoFarmToggle")
 
 farmSection:Toggle({
-	Name = "Auto X2",
+	Name = "Auto Train X2",
 	Default = false,
 	Callback = function(value)
 		autoTapX2Enabled = value
@@ -778,6 +817,17 @@ farmSection:Toggle({
 		end
 	end,
 }, "AutoClaimGiftToggle")
+
+farmSection:Toggle({
+	Name = "Auto Equip Best",
+	Default = false,
+	Callback = function(value)
+		autoEquipBestEnabled = value
+		if value then
+			startAutoEquipBestLoop()
+		end
+	end,
+}, "AutoEquipBestToggle")
 
 farmSection:Divider()
 
@@ -879,6 +929,7 @@ window:OnClose(function()
 	autoFarmEnabled = false
 	autoTapX2Enabled = false
 	autoClaimGiftEnabled = false
+	autoEquipBestEnabled = false
 	if charAddedConn then
 		charAddedConn:Disconnect()
 		charAddedConn = nil
