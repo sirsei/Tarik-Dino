@@ -80,12 +80,12 @@ for _, name in ipairs({ "DinoTeleportUI", "SeiScriptUI", "SeiScriptMacLib" }) do
 end
 
 -- ==========================================
--- PENGATURAN AUTOFARM, AUTO TAP X2 & KEYBIND
+-- PENGATURAN AUTOFARM, AUTO TAP X2, AUTO GIFT & KEYBIND
 -- ==========================================
 local autoFarmEnabled = false
 local autoTapX2Enabled = false
+local autoClaimGiftEnabled = false
 local minimizeKeybind = Enum.KeyCode.RightControl
-local uiMinimized = false
 
 local THROW_COOLDOWN = 0.35
 local CONTINUE_COOLDOWN = 0.45
@@ -95,6 +95,8 @@ local CONTINUE_WATCHDOG_TIME = 4.5
 local STATE_STUCK_TIMEOUT = 7.0
 local X2_SCAN_INTERVAL = 0.025
 local X2_TAP_COOLDOWN = 0.07
+local GIFT_SCAN_INTERVAL = 0.5
+local GIFT_CLAIM_COOLDOWN = 0.35
 local HUB_TILE_INDEX = 379
 
 -- Mentok ke puncak paling atas bar/UI (Y.Scale 0 = paling atas)
@@ -103,9 +105,11 @@ local TOP_ZONE_MAX_Y_SCALE = 0.015
 local lastThrowTime = 0
 local lastContinueTime = 0
 local lastX2TapTime = 0
+local lastGiftClaimTime = 0
 local farmState = "TELEPORT" -- "TELEPORT" | "THROW" | "CONTINUE"
 local farmLoopRunning = false
 local x2LoopRunning = false
+local giftLoopRunning = false
 
 -- ==========================================
 -- ANTI-IDLE (ANTI-AFK)
@@ -118,10 +122,41 @@ local idledConn = player.Idled:Connect(function()
 end)
 
 -- ==========================================
--- HOOK REMOTES TRAINING (AUTO HIT BUBBLE X2)
+-- HOOK REMOTES TRAINING (AUTO HIT BUBBLE X2) & GIFTS
 -- ==========================================
 local trainBubbleConn = nil
 local remotesRef = nil
+local giftsConfigRef = nil
+local giftClaimBusy = false
+
+local function ensureSharedModules()
+	local shared = ReplicatedStorage:FindFirstChild("Shared") or ReplicatedStorage:WaitForChild("Shared", 10)
+	if not shared then
+		return nil, nil
+	end
+
+	if not remotesRef then
+		local remotesModule = shared:FindFirstChild("Remotes")
+		if remotesModule then
+			local ok, Remotes = pcall(require, remotesModule)
+			if ok and type(Remotes) == "table" then
+				remotesRef = Remotes
+			end
+		end
+	end
+
+	if not giftsConfigRef then
+		local configModule = shared:FindFirstChild("Config")
+		if configModule then
+			local ok, Config = pcall(require, configModule)
+			if ok and type(Config) == "table" and type(Config.Gifts) == "table" then
+				giftsConfigRef = Config.Gifts
+			end
+		end
+	end
+
+	return remotesRef, giftsConfigRef
+end
 
 local function setupTrainBubbleHook()
 	if trainBubbleConn then
@@ -129,33 +164,101 @@ local function setupTrainBubbleHook()
 	end
 
 	task.spawn(function()
-		local shared = ReplicatedStorage:WaitForChild("Shared", 10)
-		local remotesModule = shared and shared:FindFirstChild("Remotes")
-		if not remotesModule then
-			return
-		end
-
-		local ok, Remotes = pcall(require, remotesModule)
-		if ok and Remotes then
-			remotesRef = Remotes
-			if Remotes.TrainBubble and Remotes.TrainBubbleHit then
-				trainBubbleConn = Remotes.TrainBubble.OnClientEvent:Connect(function(bubbleId, _duration)
-					if not autoTapX2Enabled or not bubbleId then
-						return
-					end
-					task.wait(0.03)
-					if autoTapX2Enabled then
-						pcall(function()
-							Remotes.TrainBubbleHit:FireServer(bubbleId)
-						end)
-					end
-				end)
-			end
+		local Remotes = ensureSharedModules()
+		if Remotes and Remotes.TrainBubble and Remotes.TrainBubbleHit then
+			trainBubbleConn = Remotes.TrainBubble.OnClientEvent:Connect(function(bubbleId, _duration)
+				if not autoTapX2Enabled or not bubbleId then
+					return
+				end
+				task.wait(0.03)
+				if autoTapX2Enabled then
+					pcall(function()
+						Remotes.TrainBubbleHit:FireServer(bubbleId)
+					end)
+				end
+			end)
 		end
 	end)
 end
 
 setupTrainBubbleHook()
+
+local function getGiftElapsed()
+	local giftStart = player:GetAttribute("GiftStart")
+	if type(giftStart) ~= "number" then
+		return -1
+	end
+	return workspace:GetServerTimeNow() - giftStart
+end
+
+local function getClaimedGiftsSet()
+	local claimed = {}
+	local rawClaimed = player:GetAttribute("GiftsClaimed")
+	if type(rawClaimed) == "string" then
+		for _, token in string.split(rawClaimed, ",") do
+			local idx = tonumber(token)
+			if idx then
+				claimed[idx] = true
+			end
+		end
+	end
+	return claimed
+end
+
+local function tryClaimReadyGifts()
+	if giftClaimBusy then
+		return
+	end
+
+	local Remotes, Gifts = ensureSharedModules()
+	if not Remotes or type(Remotes.ClaimGift) ~= "userdata" and type(Remotes.ClaimGift) ~= "function" then
+		return
+	end
+	if type(Gifts) ~= "table" then
+		return
+	end
+
+	local elapsed = getGiftElapsed()
+	if elapsed < 0 then
+		return
+	end
+
+	local claimed = getClaimedGiftsSet()
+	giftClaimBusy = true
+
+	for index, giftData in pairs(Gifts) do
+		if not autoClaimGiftEnabled then
+			break
+		end
+
+		local giftIndex = tonumber(index) or index
+		local requiredTime = type(giftData) == "table" and giftData.At or nil
+
+		if giftIndex and type(requiredTime) == "number" and (not claimed[giftIndex]) and elapsed >= requiredTime then
+			local now = os.clock()
+			if (now - lastGiftClaimTime) < GIFT_CLAIM_COOLDOWN then
+				task.wait(GIFT_CLAIM_COOLDOWN - (now - lastGiftClaimTime))
+			end
+
+			if not autoClaimGiftEnabled then
+				break
+			end
+
+			lastGiftClaimTime = os.clock()
+			local ok, result = pcall(function()
+				return Remotes.ClaimGift:InvokeServer(giftIndex)
+			end)
+
+			if ok and type(result) == "table" and result.Ok then
+				claimed[giftIndex] = true
+			end
+
+			task.wait(0.15)
+		end
+	end
+
+	giftClaimBusy = false
+end
 
 -- ==========================================
 -- FUNGSI AMBIL POSISI PERMUKAAN ATAS TARGET
@@ -395,7 +498,7 @@ local function tapGuiButton(btn)
 end
 
 -- ==========================================
--- LOOP AUTOFARM & AUTO X2
+-- LOOP AUTOFARM, AUTO X2 & AUTO CLAIM GIFT
 -- ==========================================
 local window -- dideklarasikan di bawah setelah MacLib Window dibuat
 
@@ -533,6 +636,22 @@ local function startAutoX2Loop()
 	end)
 end
 
+local function startAutoClaimGiftLoop()
+	if giftLoopRunning then
+		return
+	end
+	giftLoopRunning = true
+
+	task.spawn(function()
+		pcall(ensureSharedModules)
+		while autoClaimGiftEnabled do
+			pcall(tryClaimReadyGifts)
+			task.wait(GIFT_SCAN_INTERVAL)
+		end
+		giftLoopRunning = false
+	end)
+end
+
 local function notifyUser(title, content)
 	if window and typeof(window.Notify) == "function" then
 		pcall(function()
@@ -546,7 +665,7 @@ local function notifyUser(title, content)
 end
 
 -- ==========================================
--- UNBLUR AVATAR & TOGGLE / MINIMIZE UI
+-- UNBLUR AVATAR
 -- ==========================================
 local function getPlayerAvatarImage()
 	local ok, thumb = pcall(function()
@@ -594,43 +713,6 @@ local function unblurAvatarInGuis()
 	end
 end
 
-local function setUiMinimized(state)
-	uiMinimized = not not state
-
-	if window then
-		if uiMinimized and typeof(window.Minimize) == "function" then
-			local ok = pcall(function()
-				window:Minimize()
-			end)
-			if ok then
-				return
-			end
-		elseif (not uiMinimized) and typeof(window.Maximize) == "function" then
-			local ok = pcall(function()
-				window:Maximize()
-			end)
-			if ok then
-				return
-			end
-		end
-	end
-
-	-- Fallback jika MacLib tidak mengekspos Minimize/Maximize langsung
-	for _, gui in ipairs(playerGui:GetChildren()) do
-		if gui:IsA("ScreenGui") then
-			local base = gui:FindFirstChild("Base", true)
-			if base and base:IsA("GuiObject") then
-				base.Visible = not uiMinimized
-				return
-			end
-		end
-	end
-end
-
-local function toggleUiMinimize()
-	setUiMinimized(not uiMinimized)
-end
-
 -- ==========================================
 -- PEMBUATAN UI MACLIB (SEISCRIPT)
 -- ==========================================
@@ -641,7 +723,7 @@ window = MacLib:Window({
 	DragStyle = 1,
 	DisabledWindowControls = false,
 	ShowUserInfo = true,
-	Keybind = minimizeKeybind,
+	MinimizeKeybind = minimizeKeybind,
 	AcrylicBlur = true,
 })
 
@@ -685,6 +767,17 @@ farmSection:Toggle({
 		end
 	end,
 }, "AutoX2Toggle")
+
+farmSection:Toggle({
+	Name = "Auto Claim Gift",
+	Default = false,
+	Callback = function(value)
+		autoClaimGiftEnabled = value
+		if value then
+			startAutoClaimGiftLoop()
+		end
+	end,
+}, "AutoClaimGiftToggle")
 
 farmSection:Divider()
 
@@ -754,85 +847,26 @@ miscSection:Header({
 })
 
 local function applyMinimizeKeybind(newKey)
-	if typeof(newKey) == "EnumItem" and newKey.EnumType == Enum.KeyCode then
+	if typeof(newKey) ~= "EnumItem" or newKey.EnumType ~= Enum.KeyCode then
+		return
+	end
+	if newKey == Enum.KeyCode.Unknown or newKey == window:GetMinimizeKeybind() then
+		return
+	end
+
+	if window:SetMinimizeKeybind(newKey) then
 		minimizeKeybind = newKey
-		if window and typeof(window.SetKeybind) == "function" then
-			pcall(function()
-				window:SetKeybind(newKey)
-			end)
-		elseif window and type(window.Settings) == "table" then
-			window.Settings.Keybind = newKey
-		end
 		notifyUser("SeiScript", "Keybind minimize diubah ke: " .. newKey.Name)
 	end
 end
 
--- Coba pakai elemen Keybind/Keypicker MacLib jika tersedia, atau fallback tombol rebind
-local addedMacKeybind = false
-for _, methodName in ipairs({ "Keybind", "Keypicker" }) do
-	if typeof(miscSection[methodName]) == "function" then
-		local ok = pcall(function()
-			miscSection[methodName](miscSection, {
-				Name = "Minimize Keybind",
-				Default = minimizeKeybind,
-				Callback = function(key)
-					applyMinimizeKeybind(key)
-				end,
-			}, "MinimizeKeybind")
-		end)
-		if ok then
-			addedMacKeybind = true
-			break
-		end
-	end
-end
-
-if not addedMacKeybind then
-	local listeningForKey = false
-	local keybindLabel = miscSection:Label({
-		Text = "Minimize Keybind: " .. minimizeKeybind.Name,
-	})
-
-	miscSection:Button({
-		Name = "Set Minimize Keybind",
-		Callback = function()
-			listeningForKey = true
-			notifyUser("SeiScript", "Tekan tombol keyboard apa saja untuk mengatur keybind minimize...")
-			if keybindLabel and typeof(keybindLabel.Set) == "function" then
-				pcall(function()
-					keybindLabel:Set("Minimize Keybind: [Menekan tombol...]")
-				end)
-			end
-		end,
-	})
-
-	local rebindConn
-	rebindConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if not listeningForKey then
-			if not gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == minimizeKeybind then
-				toggleUiMinimize()
-			end
-			return
-		end
-
-		if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
-			listeningForKey = false
-			applyMinimizeKeybind(input.KeyCode)
-			if keybindLabel and typeof(keybindLabel.Set) == "function" then
-				pcall(function()
-					keybindLabel:Set("Minimize Keybind: " .. minimizeKeybind.Name)
-				end)
-			end
-		end
-	end)
-
-	miscSection:Button({
-		Name = "Toggle Minimize Sekarang",
-		Callback = function()
-			toggleUiMinimize()
-		end,
-	})
-end
+miscSection:Keybind({
+	Name = "Minimize Keybind",
+	Default = minimizeKeybind,
+	-- onBinded dipanggil saat tombol baru dipasang.
+	-- Minimize/maximize sendiri sudah diurus oleh MacLib.
+	onBinded = applyMinimizeKeybind,
+}, "MinimizeKeybind")
 
 local charAddedConn = player.CharacterAdded:Connect(function()
 	if autoFarmEnabled then
@@ -844,6 +878,7 @@ end)
 window:OnClose(function()
 	autoFarmEnabled = false
 	autoTapX2Enabled = false
+	autoClaimGiftEnabled = false
 	if charAddedConn then
 		charAddedConn:Disconnect()
 		charAddedConn = nil
@@ -858,4 +893,4 @@ window:OnClose(function()
 	end
 end)
 
-window:SelectTab(mainTab)
+mainTab:Select()
